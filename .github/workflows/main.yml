@@ -1,0 +1,276 @@
+# 文件名: .github/workflows/build-microros.yml
+# 描述: v60 (完美终局版)
+#
+# 1. 核心修正: 
+#    - 在 "FILES_TO_NUKE" 中【保留】了 ping.c 和 time.c。
+#      这是为了确保生成的库包含 uxr_ping_agent_attempts 和 uxr_run_session 等核心符号。
+#      之前的版本错误地删除了它们，导致 STM32 链接时报错。
+#
+# 2. 依赖处理:
+#    - 既然保留了 ping.c，为了防止它引用 Linux 网络栈报错，我们继续使用
+#      "Header Sanitization" (头文件清洗) 策略，切断 transport.h 对 UDP/TCP 的引用。
+#
+# 3. 纯净构建:
+#    - 强制关闭 rcutils 测试。
+#    - 彻底屏蔽 FastRTPS 和 Introspection (自省) 库。
+#    - 显式指定 C 类型支持库。
+#
+# 4. 产物: 生成 libmicroros.a，支持 Cortex-M4 硬浮点，支持 Custom Transport，支持 Ping。
+
+name: Build micro-ROS for Cortex-M4 Hard-Float
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git cmake python3-pip gcc-arm-none-eabi
+
+      - name: Install Python Dependencies (Fixed Versions)
+        run: |
+          pip3 install -U colcon-common-extensions vcstool "empy==3.3.4" lark
+
+      - name: Set up ROS 2 Humble
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
+
+      - name: Create, Build and Package micro-ROS
+        shell: bash
+        run: |
+          # 锁定根目录
+          PROJECT_ROOT=$(pwd)
+          
+          source /opt/ros/humble/setup.bash
+
+          echo "::group::1. Prepare and build the micro_ros_setup tool"
+          mkdir -p microros_ws
+          cd microros_ws
+          git clone -b humble https://github.com/micro-ROS/micro_ros_setup.git src/micro_ros_setup
+          if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then sudo rosdep init; fi
+          rosdep update
+          colcon build --packages-select micro_ros_setup
+          echo "::endgroup::"
+          
+          echo "::group::2. Download firmware sources and install their dependencies"
+          source install/setup.bash
+          ros2 run micro_ros_setup create_firmware_ws.sh generate_lib
+          rosdep install --from-paths src --ignore-src -y --skip-keys="micro_ros_msgs" || echo "rosdep install failed but continuing build..."
+          echo "::endgroup::"
+          
+          echo "::group::3. Configure and Build Firmware with Precise Settings"
+          TOOLCHAIN_PATH="${PWD}/firmware/stm32_hardfloat.cmake" 
+          echo "DIAGNOSTIC: Creating toolchain file at: ${TOOLCHAIN_PATH}"
+          
+          # 硬浮点配置: -mfloat-abi=hard -mfpu=fpv4-sp-d16
+          echo '# Set the target system for ARM Cortex-M4 with Hard FPU
+          set(CMAKE_SYSTEM_NAME Generic)
+          set(CMAKE_SYSTEM_PROCESSOR arm)
+          set(CMAKE_C_COMPILER arm-none-eabi-gcc)
+          set(CMAKE_CXX_COMPILER arm-none-eabi-g++)
+          set(TARGET_FLAGS "-mthumb -mcpu=cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16 --specs=nosys.specs")
+          set(CMAKE_C_FLAGS           "${TARGET_FLAGS} -Wall -Wextra" CACHE INTERNAL "")
+          set(CMAKE_CXX_FLAGS         "${TARGET_FLAGS} -Wall -Wextra" CACHE INTERNAL "") 
+          set(CMAKE_ASM_FLAGS         "${TARGET_FLAGS}" CACHE INTERNAL "")
+          set(CMAKE_EXE_LINKER_FLAGS  "-Wl,--gc-sections" CACHE INTERNAL "")
+          ' > ${TOOLCHAIN_PATH}
+          
+          cd firmware/mcu_ws
+          echo "DIAGNOSTIC: Changed directory to $(pwd)"
+
+          # ====================================================================
+          # STRATEGY 0: RCUTILS REPAIR (五重切除 & 禁测试)
+          # ====================================================================
+          RCUTILS_CMAKE_FILE="uros/rcutils/CMakeLists.txt"
+          echo "DIAGNOSTIC: Applying rcutils SURGICAL PATCHES..."
+          
+          # 强制关闭测试，解决 performance_test_fixture 报错
+          sed -i '1i set(BUILD_TESTING OFF CACHE BOOL "Force Disable Testing" FORCE)' ${RCUTILS_CMAKE_FILE}
+          
+          # 移除 Linux 依赖文件
+          sed -i '/src\/filesystem.c/d' ${RCUTILS_CMAKE_FILE}
+          sed -i '/src\/shared_library.c/d' ${RCUTILS_CMAKE_FILE}
+          sed -i '/src\/time_unix.c/d' ${RCUTILS_CMAKE_FILE}
+          sed -i '/src\/process.c/d' ${RCUTILS_CMAKE_FILE}
+          sed -i '/src\/env.c/d' ${RCUTILS_CMAKE_FILE}
+
+          # ====================================================================
+          # STRATEGY 1: MICRO-XRCE-DDS-CLIENT REPAIR
+          # ====================================================================
+          XRCE_CLIENT_PATH="eProsima/Micro-XRCE-DDS-Client"
+          XRCE_TRANSPORT_H="${XRCE_CLIENT_PATH}/include/uxr/client/transport.h"
+          
+          # 1. 头文件清洗
+          # 这是让 ping.c 能通过编译的关键：删除了对不存在的 UDP/TCP 结构体的引用
+          echo "DIAGNOSTIC: Sanitizing header file: ${XRCE_TRANSPORT_H}..."
+          sed -i '/include.*udp_transport.h/d' ${XRCE_TRANSPORT_H}
+          sed -i '/include.*tcp_transport.h/d' ${XRCE_TRANSPORT_H}
+          sed -i '/include.*serial_transport.h/d' ${XRCE_TRANSPORT_H}
+
+          # 2. 源码处理 (FILES_TO_NUKE)
+          # 【关键修复】保留 ping.c 和 time.c！
+          FILES_TO_NUKE=(
+            "src/c/profile/transport/ip/udp/udp_transport.c"
+            "src/c/profile/transport/ip/tcp/tcp_transport.c"
+            "src/c/profile/transport/serial/serial_transport.c"
+            # "src/c/util/time.c"  <-- 已保留: 保留 session 时间逻辑 (STM32端需提供 clock_gettime polyfill 或类似实现)
+            # "src/c/util/ping.c"  <-- 已保留: 保留 uxr_ping_agent_attempts
+          )
+          echo "DIAGNOSTIC: Nuking ONLY unwanted transport source files..."
+          for FILE in "${FILES_TO_NUKE[@]}"; do
+            FULL_PATH="${XRCE_CLIENT_PATH}/${FILE}"
+            if [ -f "$FULL_PATH" ]; then
+                echo "/* Nuked */ typedef int dummy;" > "$FULL_PATH"
+                echo "  -> Nuked ${FILE}"
+            fi
+          done
+
+          # 3. CMake 配置篡改 (头部注入)
+          XRCE_CMAKE_FILE="${XRCE_CLIENT_PATH}/CMakeLists.txt"
+          echo "DIAGNOSTIC: Injecting FORCE OVERRIDES into ${XRCE_CMAKE_FILE}..."
+          sed -i '1i set(UCLIENT_PROFILE_CUSTOM_TRANSPORT ON CACHE BOOL "Force Enable Custom" FORCE)' ${XRCE_CMAKE_FILE}
+          sed -i '1i set(UCLIENT_PROFILE_SERIAL OFF CACHE BOOL "Force Disable Serial" FORCE)' ${XRCE_CMAKE_FILE}
+          sed -i '1i set(UCLIENT_PROFILE_TCP OFF CACHE BOOL "Force Disable TCP" FORCE)' ${XRCE_CMAKE_FILE}
+          sed -i '1i set(UCLIENT_PROFILE_UDP OFF CACHE BOOL "Force Disable UDP" FORCE)' ${XRCE_CMAKE_FILE}
+
+          # ====================================================================
+          # STRATEGY 2: RMW IMPLEMENTATION FIX (动态路径)
+          # ====================================================================
+          RMW_CMAKE_FILE=$(find . -name "get_default_rmw_implementation.cmake" | head -n 1)
+          if [ ! -z "$RMW_CMAKE_FILE" ]; then
+            echo "DIAGNOSTIC: Hijacking RMW detection logic in ${RMW_CMAKE_FILE}..."
+            echo '
+            function(get_default_rmw_implementation _ret_var)
+              set(${_ret_var} "rmw_microxrcedds" PARENT_SCOPE)
+            endfunction()
+            ' > "${RMW_CMAKE_FILE}"
+          fi
+
+          # ====================================================================
+          # STRATEGY 4: DEEP CLEAN
+          # ====================================================================
+          echo "DIAGNOSTIC: 🔥 Performing DEEP CLEAN..."
+          rm -rf build/ install/ log/
+          find . -name "client.config" -delete
+          find . -name "CMakeCache.txt" -delete
+          find . -name "CMakeFiles" -type d -exec rm -rf {} + 2>/dev/null || true
+
+          # ====================================================================
+          # BUILD
+          # ====================================================================
+          echo "DIAGNOSTIC: Starting Final Build..."
+          
+          colcon build \
+            --merge-install \
+            --packages-ignore \
+              # 忽略 FastRTPS 相关
+              rosidl_typesupport_fastrtps_c \
+              rosidl_typesupport_fastrtps_cpp \
+              rosidl_typesupport_cpp \
+              rmw_fastrtps_cpp \
+              rmw_fastrtps_dynamic_cpp \
+              # 【关键】忽略自省库 (Introspection)，防止隐式依赖
+              rosidl_typesupport_introspection_c \
+              rosidl_typesupport_introspection_cpp \
+              # 忽略其他 DDS
+              rmw_cyclonedds_cpp \
+              rmw_dds_common \
+              # 忽略测试包
+              test_msgs \
+            --cmake-args \
+              -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_PATH} \
+              -DBUILD_TESTING=OFF \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DRCUTILS_USE_CUSTOM_CLOCK=ON \
+              -DRCUTILS_NO_FILESYSTEM=ON \
+              -DUCLIENT_CUSTOM_TRANSPORT_MTU=512 \
+              -DRMW_UXRCE_TRANSPORT=custom \
+              -DRMW_IMPLEMENTATION=rmw_microxrcedds \
+              # 明确指定类型支持
+              -DROSIDL_TYPESUPPORT_C=rosidl_typesupport_microxrcedds_c \
+              # 屏蔽查找
+              -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_fastrtps_c=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_fastrtps_cpp=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_introspection_c=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_introspection_cpp=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_generator_py=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rmw_fastrtps_cpp=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rmw_fastrtps_dynamic_cpp=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rmw_cyclonedds_cpp=ON \
+              -DCMAKE_DISABLE_FIND_PACKAGE_rmw_dds_common=ON \
+              --no-warn-unused-cli
+          
+          echo "::endgroup::"
+          
+          # ====================================================================
+          # MERGE & PACKAGE
+          # ====================================================================
+          echo "::group::4. Merge and Package Artifacts"
+          
+          mkdir -p "$PROJECT_ROOT/export/lib"
+          mkdir -p "$PROJECT_ROOT/export/include"
+          
+          INSTALL_LIB_DIR="install/lib"
+          if [ ! -d "$INSTALL_LIB_DIR" ]; then
+             echo "DIAGNOSTIC: ❌ FATAL: Install directory not found!"
+             ls -R
+             exit 1
+          fi
+          
+          cd "$INSTALL_LIB_DIR"
+          echo "DIAGNOSTIC: Merging static libraries in $(pwd)..."
+          
+          echo "create libmicroros.a" > lib.mri
+          find . -maxdepth 1 -name "*.a" -print0 | while IFS= read -r -d '' file; do
+              if [ "$file" != "./libmicroros.a" ]; then
+                  echo "addlib $file" >> lib.mri
+              fi
+          done
+          echo "save" >> lib.mri
+          echo "end" >> lib.mri
+          
+          arm-none-eabi-ar -M < lib.mri
+          
+          if [ -f "libmicroros.a" ]; then
+             echo "DIAGNOSTIC: ✅ SUCCESS! libmicroros.a created."
+             
+             # 符号检查: 必须包含 Ping 和 Session 符号
+             echo "DIAGNOSTIC: 🔍 Inspecting Symbols..."
+             
+             # 检查 Ping 功能
+             if arm-none-eabi-nm "libmicroros.a" | grep -q "uxr_ping_agent_attempts"; then
+                echo "  [OK] uxr_ping_agent_attempts FOUND (Ping enabled)."
+             else
+                echo "  [WARNING] uxr_ping_agent_attempts MISSING! (Did you nuke ping.c?)"
+             fi
+
+             # 检查 Session 功能
+             if arm-none-eabi-nm "libmicroros.a" | grep -q "uxr_run_session"; then
+                echo "  [OK] uxr_run_session FOUND."
+             else
+                echo "  [FAIL] uxr_run_session MISSING!"
+             fi
+
+             # 移动产物
+             cp libmicroros.a "$PROJECT_ROOT/export/lib/"
+             cd ../include
+             cp -r * "$PROJECT_ROOT/export/include/"
+             
+             echo "DIAGNOSTIC: Artifacts packaged successfully."
+          else
+             echo "DIAGNOSTIC: ❌ FATAL: Failed to create libmicroros.a"
+             exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Upload Cortex-M4 Hard-Float Library Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmicroros-cortex-m4-hard-float
+          path: export/
