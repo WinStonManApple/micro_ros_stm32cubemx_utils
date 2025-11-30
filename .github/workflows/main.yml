@@ -1,14 +1,13 @@
 # 文件名: .github/workflows/build-microros.yml
-# 描述: v61 (全局强制配置版)
+# 描述: v58 (工具库裁剪版)
 #
-# 1. 继承: 保留所有之前的修复 (rcutils/client 修复, FastRTPS屏蔽, 依赖隔离)。
-# 2. 新增修复: 解决 "rosidl_runtime_c" (及潜在的其他包) 报错 "performance_test_fixture not found"。
-#    原因: 命令行参数 -DBUILD_TESTING=OFF 在某些包中失效，导致测试代码被编译。
-# 3. 解决方案: 使用 find + sed 对工作空间内 **所有** CMakeLists.txt 进行批量修改。
-#    在每个文件头部强制插入:
-#      set(BUILD_TESTING OFF ... FORCE)
-#      set(BUILD_SHARED_LIBS OFF ... FORCE)
-#    这确保了无论哪个包，都绝对不会编译测试代码或动态库。
+# 1. 继承: 保留 v57 的所有核心修复 (rcutils/client核平, Introspection/FastRTPS屏蔽, Ping/Time保留)。
+# 2. 新增修复: 解决 "micro_ros_utilities" 编译失败问题。
+#    原因: 该库依赖 rosidl_typesupport_introspection (自省库) 来实现自动内存分配。
+#    但我们为了切断 FastRTPS 依赖，已经屏蔽了自省库。这导致了 REQUIRED 依赖冲突。
+# 3. 解决方案: 在 --packages-ignore 中添加 micro_ros_utilities。
+#    这意味着生成的库不包含自动内存分配辅助函数。用户需在 STM32 代码中手动管理消息内存。
+#    这是一个为了实现"纯净无依赖"目标的必要权衡。
 
 name: Build micro-ROS for Cortex-M4 Hard-Float
 
@@ -61,7 +60,6 @@ jobs:
           TOOLCHAIN_PATH="${PWD}/firmware/stm32_hardfloat.cmake" 
           echo "DIAGNOSTIC: Creating toolchain file at: ${TOOLCHAIN_PATH}"
           
-          # 硬浮点配置 (开启异常支持)
           echo '# Set the target system for ARM Cortex-M4 with Hard FPU
           set(CMAKE_SYSTEM_NAME Generic)
           set(CMAKE_SYSTEM_PROCESSOR arm)
@@ -78,23 +76,11 @@ jobs:
           echo "DIAGNOSTIC: Changed directory to $(pwd)"
 
           # ====================================================================
-          # STRATEGY -1: GLOBAL CONFIG INJECTION (全域强制注入)
-          # ====================================================================
-          # 这是一个大招。我们不信任命令行的 -D 参数。
-          # 我们遍历所有 CMakeLists.txt，在第一行强行插入配置。
-          # 1. 强制关闭测试 (BUILD_TESTING OFF)
-          # 2. 强制关闭动态库 (BUILD_SHARED_LIBS OFF)
-          
-          echo "DIAGNOSTIC: 🔥 Injecting global configuration into ALL CMakeLists.txt..."
-          find . -name "CMakeLists.txt" -exec sed -i '1i set(BUILD_TESTING OFF CACHE BOOL "Force Disable Testing" FORCE)' {} +
-          find . -name "CMakeLists.txt" -exec sed -i '1i set(BUILD_SHARED_LIBS OFF CACHE BOOL "Force Disable Shared Libs" FORCE)' {} +
-          echo "DIAGNOSTIC: Global injection complete."
-
-          # ====================================================================
-          # STRATEGY 0: RCUTILS REPAIR (保持五重切除)
+          # STRATEGY 0: RCUTILS REPAIR
           # ====================================================================
           RCUTILS_CMAKE_FILE="uros/rcutils/CMakeLists.txt"
           echo "DIAGNOSTIC: Applying rcutils SURGICAL PATCHES..."
+          sed -i '1i set(BUILD_TESTING OFF CACHE BOOL "Force Disable Testing" FORCE)' ${RCUTILS_CMAKE_FILE}
           sed -i '/src\/filesystem.c/d' ${RCUTILS_CMAKE_FILE}
           sed -i '/src\/shared_library.c/d' ${RCUTILS_CMAKE_FILE}
           sed -i '/src\/time_unix.c/d' ${RCUTILS_CMAKE_FILE}
@@ -112,11 +98,12 @@ jobs:
           sed -i '/include.*tcp_transport.h/d' ${XRCE_TRANSPORT_H}
           sed -i '/include.*serial_transport.h/d' ${XRCE_TRANSPORT_H}
 
-          # 源码处理 (保留 Ping/Time)
           FILES_TO_NUKE=(
             "src/c/profile/transport/ip/udp/udp_transport.c"
             "src/c/profile/transport/ip/tcp/tcp_transport.c"
             "src/c/profile/transport/serial/serial_transport.c"
+            # "src/c/util/time.c"  <-- 保留
+            # "src/c/util/ping.c"  <-- 保留
           )
           echo "DIAGNOSTIC: Nuking ONLY unwanted transport source files..."
           for FILE in "${FILES_TO_NUKE[@]}"; do
@@ -126,9 +113,7 @@ jobs:
             fi
           done
 
-          # CMake 配置篡改
           XRCE_CMAKE_FILE="${XRCE_CLIENT_PATH}/CMakeLists.txt"
-          echo "DIAGNOSTIC: Injecting FORCE OVERRIDES into ${XRCE_CMAKE_FILE}..."
           sed -i '1i set(UCLIENT_PROFILE_CUSTOM_TRANSPORT ON CACHE BOOL "Force Enable Custom" FORCE)' ${XRCE_CMAKE_FILE}
           sed -i '1i set(UCLIENT_PROFILE_SERIAL OFF CACHE BOOL "Force Disable Serial" FORCE)' ${XRCE_CMAKE_FILE}
           sed -i '1i set(UCLIENT_PROFILE_TCP OFF CACHE BOOL "Force Disable TCP" FORCE)' ${XRCE_CMAKE_FILE}
@@ -155,23 +140,31 @@ jobs:
           find . -name "CMakeFiles" -type d -exec rm -rf {} + 2>/dev/null || true
 
           # ====================================================================
-          # BUILD
+          # BUILD (裁剪版)
           # ====================================================================
           echo "DIAGNOSTIC: Starting Final Build..."
           
           colcon build \
             --merge-install \
             --packages-ignore \
+              # 忽略 FastRTPS/FastCDR 依赖链
               rosidl_typesupport_fastrtps_c \
               rosidl_typesupport_fastrtps_cpp \
               rosidl_typesupport_cpp \
-              rosidl_typesupport_introspection_c \
-              rosidl_typesupport_introspection_cpp \
               rmw_fastrtps_cpp \
               rmw_fastrtps_dynamic_cpp \
               rmw_cyclonedds_cpp \
               rmw_dds_common \
+              # 忽略自省库 (Introspection)
+              rosidl_typesupport_introspection_c \
+              rosidl_typesupport_introspection_cpp \
+              # 【v58新增】忽略依赖自省库的工具
+              micro_ros_utilities \
+              # 忽略不必要的库
+              libyaml_vendor \
+              # 忽略测试
               test_msgs \
+              tracetools_test \
             --cmake-args \
               -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_PATH} \
               -DBUILD_TESTING=OFF \
@@ -229,7 +222,7 @@ jobs:
              
              echo "DIAGNOSTIC: 🔍 Inspecting Symbols..."
              if arm-none-eabi-nm "libmicroros.a" | grep -q "uxr_ping_agent_attempts"; then
-                echo "  [OK] uxr_ping_agent_attempts FOUND."
+                echo "  [OK] uxr_ping_agent_attempts FOUND (Ping enabled)."
              else
                 echo "  [WARNING] uxr_ping_agent_attempts MISSING!"
              fi
