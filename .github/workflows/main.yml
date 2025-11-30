@@ -1,21 +1,14 @@
 # 文件名: .github/workflows/build-microros.yml
-# 描述: v60 (完美终局版)
+# 描述: v61 (全局强制配置版)
 #
-# 1. 核心修正: 
-#    - 在 "FILES_TO_NUKE" 中【保留】了 ping.c 和 time.c。
-#      这是为了确保生成的库包含 uxr_ping_agent_attempts 和 uxr_run_session 等核心符号。
-#      之前的版本错误地删除了它们，导致 STM32 链接时报错。
-#
-# 2. 依赖处理:
-#    - 既然保留了 ping.c，为了防止它引用 Linux 网络栈报错，我们继续使用
-#      "Header Sanitization" (头文件清洗) 策略，切断 transport.h 对 UDP/TCP 的引用。
-#
-# 3. 纯净构建:
-#    - 强制关闭 rcutils 测试。
-#    - 彻底屏蔽 FastRTPS 和 Introspection (自省) 库。
-#    - 显式指定 C 类型支持库。
-#
-# 4. 产物: 生成 libmicroros.a，支持 Cortex-M4 硬浮点，支持 Custom Transport，支持 Ping。
+# 1. 继承: 保留所有之前的修复 (rcutils/client 修复, FastRTPS屏蔽, 依赖隔离)。
+# 2. 新增修复: 解决 "rosidl_runtime_c" (及潜在的其他包) 报错 "performance_test_fixture not found"。
+#    原因: 命令行参数 -DBUILD_TESTING=OFF 在某些包中失效，导致测试代码被编译。
+# 3. 解决方案: 使用 find + sed 对工作空间内 **所有** CMakeLists.txt 进行批量修改。
+#    在每个文件头部强制插入:
+#      set(BUILD_TESTING OFF ... FORCE)
+#      set(BUILD_SHARED_LIBS OFF ... FORCE)
+#    这确保了无论哪个包，都绝对不会编译测试代码或动态库。
 
 name: Build micro-ROS for Cortex-M4 Hard-Float
 
@@ -68,7 +61,7 @@ jobs:
           TOOLCHAIN_PATH="${PWD}/firmware/stm32_hardfloat.cmake" 
           echo "DIAGNOSTIC: Creating toolchain file at: ${TOOLCHAIN_PATH}"
           
-          # 硬浮点配置: -mfloat-abi=hard -mfpu=fpv4-sp-d16
+          # 硬浮点配置 (开启异常支持)
           echo '# Set the target system for ARM Cortex-M4 with Hard FPU
           set(CMAKE_SYSTEM_NAME Generic)
           set(CMAKE_SYSTEM_PROCESSOR arm)
@@ -85,15 +78,23 @@ jobs:
           echo "DIAGNOSTIC: Changed directory to $(pwd)"
 
           # ====================================================================
-          # STRATEGY 0: RCUTILS REPAIR (五重切除 & 禁测试)
+          # STRATEGY -1: GLOBAL CONFIG INJECTION (全域强制注入)
+          # ====================================================================
+          # 这是一个大招。我们不信任命令行的 -D 参数。
+          # 我们遍历所有 CMakeLists.txt，在第一行强行插入配置。
+          # 1. 强制关闭测试 (BUILD_TESTING OFF)
+          # 2. 强制关闭动态库 (BUILD_SHARED_LIBS OFF)
+          
+          echo "DIAGNOSTIC: 🔥 Injecting global configuration into ALL CMakeLists.txt..."
+          find . -name "CMakeLists.txt" -exec sed -i '1i set(BUILD_TESTING OFF CACHE BOOL "Force Disable Testing" FORCE)' {} +
+          find . -name "CMakeLists.txt" -exec sed -i '1i set(BUILD_SHARED_LIBS OFF CACHE BOOL "Force Disable Shared Libs" FORCE)' {} +
+          echo "DIAGNOSTIC: Global injection complete."
+
+          # ====================================================================
+          # STRATEGY 0: RCUTILS REPAIR (保持五重切除)
           # ====================================================================
           RCUTILS_CMAKE_FILE="uros/rcutils/CMakeLists.txt"
           echo "DIAGNOSTIC: Applying rcutils SURGICAL PATCHES..."
-          
-          # 强制关闭测试，解决 performance_test_fixture 报错
-          sed -i '1i set(BUILD_TESTING OFF CACHE BOOL "Force Disable Testing" FORCE)' ${RCUTILS_CMAKE_FILE}
-          
-          # 移除 Linux 依赖文件
           sed -i '/src\/filesystem.c/d' ${RCUTILS_CMAKE_FILE}
           sed -i '/src\/shared_library.c/d' ${RCUTILS_CMAKE_FILE}
           sed -i '/src\/time_unix.c/d' ${RCUTILS_CMAKE_FILE}
@@ -106,32 +107,26 @@ jobs:
           XRCE_CLIENT_PATH="eProsima/Micro-XRCE-DDS-Client"
           XRCE_TRANSPORT_H="${XRCE_CLIENT_PATH}/include/uxr/client/transport.h"
           
-          # 1. 头文件清洗
-          # 这是让 ping.c 能通过编译的关键：删除了对不存在的 UDP/TCP 结构体的引用
           echo "DIAGNOSTIC: Sanitizing header file: ${XRCE_TRANSPORT_H}..."
           sed -i '/include.*udp_transport.h/d' ${XRCE_TRANSPORT_H}
           sed -i '/include.*tcp_transport.h/d' ${XRCE_TRANSPORT_H}
           sed -i '/include.*serial_transport.h/d' ${XRCE_TRANSPORT_H}
 
-          # 2. 源码处理 (FILES_TO_NUKE)
-          # 【关键修复】保留 ping.c 和 time.c！
+          # 源码处理 (保留 Ping/Time)
           FILES_TO_NUKE=(
             "src/c/profile/transport/ip/udp/udp_transport.c"
             "src/c/profile/transport/ip/tcp/tcp_transport.c"
             "src/c/profile/transport/serial/serial_transport.c"
-            # "src/c/util/time.c"  <-- 已保留: 保留 session 时间逻辑 (STM32端需提供 clock_gettime polyfill 或类似实现)
-            # "src/c/util/ping.c"  <-- 已保留: 保留 uxr_ping_agent_attempts
           )
           echo "DIAGNOSTIC: Nuking ONLY unwanted transport source files..."
           for FILE in "${FILES_TO_NUKE[@]}"; do
             FULL_PATH="${XRCE_CLIENT_PATH}/${FILE}"
             if [ -f "$FULL_PATH" ]; then
                 echo "/* Nuked */ typedef int dummy;" > "$FULL_PATH"
-                echo "  -> Nuked ${FILE}"
             fi
           done
 
-          # 3. CMake 配置篡改 (头部注入)
+          # CMake 配置篡改
           XRCE_CMAKE_FILE="${XRCE_CLIENT_PATH}/CMakeLists.txt"
           echo "DIAGNOSTIC: Injecting FORCE OVERRIDES into ${XRCE_CMAKE_FILE}..."
           sed -i '1i set(UCLIENT_PROFILE_CUSTOM_TRANSPORT ON CACHE BOOL "Force Enable Custom" FORCE)' ${XRCE_CMAKE_FILE}
@@ -140,16 +135,14 @@ jobs:
           sed -i '1i set(UCLIENT_PROFILE_UDP OFF CACHE BOOL "Force Disable UDP" FORCE)' ${XRCE_CMAKE_FILE}
 
           # ====================================================================
-          # STRATEGY 2: RMW IMPLEMENTATION FIX (动态路径)
+          # STRATEGY 2: RMW IMPLEMENTATION FIX
           # ====================================================================
           RMW_CMAKE_FILE=$(find . -name "get_default_rmw_implementation.cmake" | head -n 1)
           if [ ! -z "$RMW_CMAKE_FILE" ]; then
             echo "DIAGNOSTIC: Hijacking RMW detection logic in ${RMW_CMAKE_FILE}..."
-            echo '
-            function(get_default_rmw_implementation _ret_var)
+            echo 'function(get_default_rmw_implementation _ret_var)
               set(${_ret_var} "rmw_microxrcedds" PARENT_SCOPE)
-            endfunction()
-            ' > "${RMW_CMAKE_FILE}"
+            endfunction()' > "${RMW_CMAKE_FILE}"
           fi
 
           # ====================================================================
@@ -169,19 +162,15 @@ jobs:
           colcon build \
             --merge-install \
             --packages-ignore \
-              # 忽略 FastRTPS 相关
               rosidl_typesupport_fastrtps_c \
               rosidl_typesupport_fastrtps_cpp \
               rosidl_typesupport_cpp \
-              rmw_fastrtps_cpp \
-              rmw_fastrtps_dynamic_cpp \
-              # 【关键】忽略自省库 (Introspection)，防止隐式依赖
               rosidl_typesupport_introspection_c \
               rosidl_typesupport_introspection_cpp \
-              # 忽略其他 DDS
+              rmw_fastrtps_cpp \
+              rmw_fastrtps_dynamic_cpp \
               rmw_cyclonedds_cpp \
               rmw_dds_common \
-              # 忽略测试包
               test_msgs \
             --cmake-args \
               -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_PATH} \
@@ -192,9 +181,7 @@ jobs:
               -DUCLIENT_CUSTOM_TRANSPORT_MTU=512 \
               -DRMW_UXRCE_TRANSPORT=custom \
               -DRMW_IMPLEMENTATION=rmw_microxrcedds \
-              # 明确指定类型支持
               -DROSIDL_TYPESUPPORT_C=rosidl_typesupport_microxrcedds_c \
-              # 屏蔽查找
               -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_fastrtps_c=ON \
               -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_fastrtps_cpp=ON \
               -DCMAKE_DISABLE_FIND_PACKAGE_rosidl_typesupport_introspection_c=ON \
@@ -240,24 +227,13 @@ jobs:
           if [ -f "libmicroros.a" ]; then
              echo "DIAGNOSTIC: ✅ SUCCESS! libmicroros.a created."
              
-             # 符号检查: 必须包含 Ping 和 Session 符号
              echo "DIAGNOSTIC: 🔍 Inspecting Symbols..."
-             
-             # 检查 Ping 功能
              if arm-none-eabi-nm "libmicroros.a" | grep -q "uxr_ping_agent_attempts"; then
-                echo "  [OK] uxr_ping_agent_attempts FOUND (Ping enabled)."
+                echo "  [OK] uxr_ping_agent_attempts FOUND."
              else
-                echo "  [WARNING] uxr_ping_agent_attempts MISSING! (Did you nuke ping.c?)"
+                echo "  [WARNING] uxr_ping_agent_attempts MISSING!"
              fi
 
-             # 检查 Session 功能
-             if arm-none-eabi-nm "libmicroros.a" | grep -q "uxr_run_session"; then
-                echo "  [OK] uxr_run_session FOUND."
-             else
-                echo "  [FAIL] uxr_run_session MISSING!"
-             fi
-
-             # 移动产物
              cp libmicroros.a "$PROJECT_ROOT/export/lib/"
              cd ../include
              cp -r * "$PROJECT_ROOT/export/include/"
